@@ -1,0 +1,1476 @@
+
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import json
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import messagebox, filedialog
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+import math
+from ttkbootstrap.widgets import DateEntry
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.pyplot as plt
+from tkinter import filedialog, messagebox
+import pandas as pd
+
+# Essayer d'importer mplfinance pour les graphiques en chandeliers
+try:
+    import mplfinance as mpf
+except ImportError:
+    mpf = None
+
+# -------------------------------------------------------------------
+# Classe ToolTip : Affiche une infobulle lors du survol d'un widget
+# -------------------------------------------------------------------
+class ToolTip:
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tooltip_window = None
+        self.widget.bind("<Enter>", self.show_tooltip)
+        self.widget.bind("<Leave>", self.hide_tooltip)
+
+    def show_tooltip(self, event=None):
+        if self.tooltip_window or not self.text:
+            return
+        x = self.widget.winfo_rootx() + 20
+        y = self.widget.winfo_rooty() + 20
+        self.tooltip_window = tw = tk.Toplevel(self.widget)
+        tw.wm_overrideredirect(True)
+        tw.wm_geometry(f"+{x}+{y}")
+        label = tk.Label(tw, text=self.text, background="lightyellow",
+                         relief="solid", borderwidth=1, font=("Arial", 10))
+        label.pack()
+
+    def hide_tooltip(self, event=None):
+        if self.tooltip_window:
+            self.tooltip_window.destroy()
+        self.tooltip_window = None
+
+# -------------------------------------------------------------------
+# Classe Portfolio : Gestion du portefeuille d'actions
+# -------------------------------------------------------------------
+class Portfolio:
+    def __init__(self, cash):
+        self.cash = cash
+        self.assets = {}        # {symbol: (quantity, purchase_price, current_price, purchase_date)}
+        self.transactions = []  # Liste des transactions
+
+    def add_asset(self, symbol, quantity=1):
+        symbol = symbol.upper()
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period="1d")
+        if data.empty:
+            return f"❌ {symbol} introuvable."
+        price = data["Close"].iloc[-1]
+        purchase_date = datetime.now().strftime("%Y-%m-%d")
+        
+        if symbol in self.assets:
+            old_qty, old_purchase_price, _, old_date = self.assets[symbol]
+            new_quantity = old_qty + quantity
+            new_purchase_price = ((old_purchase_price * old_qty) + (price * quantity)) / new_quantity
+            self.assets[symbol] = (new_quantity, new_purchase_price, price, old_date)
+        else:
+            self.assets[symbol] = (quantity, price, price, purchase_date)
+        
+        self.cash -= price * quantity
+        self.transactions.append({
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "Achat",
+            "symbole": symbol,
+            "quantité": quantity,
+            "prix": price,
+            "total": price * quantity
+        })
+        return f"✅ Achat de {quantity} {symbol} à {price:.4f} USD (coût total {price * quantity:.4f} USD)."
+
+    def sell_asset(self, symbol, quantity):
+        symbol = symbol.upper()
+        if symbol not in self.assets:
+            return f"❌ {symbol} non présent dans le portefeuille."
+        current_qty, purchase_price, _, purchase_date = self.assets[symbol]
+        if quantity > current_qty:
+            return f"❌ Quantité insuffisante ({current_qty} dispo)."
+        
+        ticker = yf.Ticker(symbol)
+        data = ticker.history(period="1d")
+        if data.empty:
+            return f"❌ Prix actuel de {symbol} indisponible."
+        new_current_price = data["Close"].iloc[-1]
+        sale_value = new_current_price * quantity
+        self.cash += sale_value
+        
+        if quantity == current_qty:
+            del self.assets[symbol]
+        else:
+            self.assets[symbol] = (current_qty - quantity, purchase_price, new_current_price, purchase_date)
+        
+        self.transactions.append({
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "Vente",
+            "symbole": symbol,
+            "quantité": quantity,
+            "prix": new_current_price,
+            "total": sale_value
+        })
+        return f"✅ Vente de {quantity} {symbol} à {new_current_price:.4f} USD (recette {sale_value:.4f} USD)."
+
+    def display_portfolio(self):
+        allocation_data = []
+        total_value = 0
+
+        for symbol, (qty, purchase_price, current_price, purchase_date) in self.assets.items():
+            ticker = yf.Ticker(symbol)
+            data = ticker.history(period="1d")
+            new_current_price = data["Close"].iloc[-1] if not data.empty else current_price
+
+            value = qty * new_current_price
+            total_value += value
+            asset_return = ((new_current_price / purchase_price) - 1) * 100 if purchase_price != 0 else 0
+            allocation_data.append([symbol, qty, purchase_price, new_current_price, value, purchase_date, asset_return])
+        
+        if total_value > 0:
+            for row in allocation_data:
+                row.append((row[4] / total_value) * 100)
+        return allocation_data, self.cash, total_value
+
+    def to_dict(self):
+        return {
+            "cash": self.cash,
+            "assets": self.assets,
+            "transactions": self.transactions
+        }
+
+    @staticmethod
+    def from_dict(data):
+        p = Portfolio(data.get("cash", 0))
+        p.assets = data.get("assets", {})
+        p.transactions = data.get("transactions", [])
+        return p
+
+# -------------------------------------------------------------------
+# Classe PortfolioApp : Interface utilisateur avec ttkbootstrap
+# -------------------------------------------------------------------
+class PortfolioApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Gestion de Portefeuille d'Actions")
+        self.root.minsize(1100, 750)
+
+        self.create_menu_bar()
+
+        self.style = ttk.Style()
+        self.style.configure("TButton", font=("Helvetica", 10, "bold"), padding=5)
+        self.style.configure("TLabel", font=("Helvetica", 10), padding=5)
+
+        self.portfolio = None
+        self.portfolio_history = []  # Pour le graphique live
+        self.alerts = []             # Liste des alertes
+
+        self.notebook = ttk.Notebook(root)
+        self.notebook.pack(fill="both", expand=True)
+
+        # Création des onglets
+        self.tab_dashboard = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_dashboard, text="Dashboard")
+        self.create_dashboard_tab()
+
+        self.tab_transactions = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_transactions, text="Transactions")
+        self.create_transactions_tab()
+
+        self.tab_analysis = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_analysis, text="Analyse")
+        self.create_analysis_tab()
+
+        self.tab_histdata = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_histdata, text="Données Historiques")
+        self.create_histdata_tab()
+
+        self.tab_performance = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_performance, text="Performance")
+        self.create_performance_tab()
+
+        self.tab_breakdown = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_breakdown, text="Graphiques")
+        self.create_breakdown_tab()
+        
+        self.tab_settings = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_settings, text="Paramètres")
+        self.create_settings_tab()
+
+        self.update_interval = 5000  # ms
+        self.refresh_live_data()
+
+
+    def init_breakdown_cache(self):
+        """Construit ou met à jour le cache : hist, returns, country, sector pour chaque actif."""
+        # si déjà construit, ne rien faire
+        if hasattr(self, "breakdown_cache") and set(self.breakdown_cache) == set(self.portfolio.assets):
+            return
+
+        self.breakdown_cache = {}
+        for symbol, (qty, purchase_price, current_price, purchase_date) in self.portfolio.assets.items():
+            t = yf.Ticker(symbol)
+            # 1) prix historique et rendements
+            hist = t.history(start=purchase_date)
+            rets = hist["Close"].pct_change() if not hist.empty else pd.Series(dtype=float)
+            # 2) métadonnées
+            info = {}
+            try:
+                md = t.info
+                info["country"] = md.get("country", "Inconnu")
+                info["sector"]  = md.get("sector",  "Inconnu")
+            except Exception:
+                info["country"] = info["sector"] = "Inconnu"
+
+            self.breakdown_cache[symbol] = {
+                "hist":   hist,
+                "returns": rets,
+                "country": info["country"],
+                "sector":  info["sector"],
+                "value":   qty * current_price
+            }
+
+
+    def set_benchmark(self):
+        symb = self.entry_benchmark.get().upper().strip()
+        if not symb:
+            messagebox.showerror("Erreur", "Ticker benchmark vide.")
+            return
+        # teste rapidement son existence
+        data = yf.Ticker(symb).history(period="1d")
+        if data.empty:
+            messagebox.showerror("Erreur", f"{symb} introuvable.")
+            return
+        self.benchmark = symb
+        self.label_bench.config(text=f"{symb}")
+        # rafraîchis tout de suite le dashboard
+        self.update_dashboard()
+
+    def get_benchmark_return(self, purchase_date):
+        """Rendement % du benchmark de purchase_date à aujourd’hui."""
+        if not hasattr(self, "benchmark"):
+            return None
+        today = datetime.now().strftime("%Y-%m-%d")
+        hist = yf.Ticker(self.benchmark).history(
+            start=purchase_date, 
+            end=(datetime.strptime(purchase_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+        )
+        if hist.empty:
+            return None
+        price_then = hist["Close"].iloc[0]
+        # prix actuel
+        curr = yf.Ticker(self.benchmark).history(period="1d")["Close"].iloc[-1]
+        return (curr / price_then - 1) * 100
+
+    # ---------------------- Barre de menu ----------------------
+    def create_menu_bar(self):
+        menubar = tk.Menu(self.root)
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Importer CSV", command=self.import_csv)
+        file_menu.add_command(label="Sauvegarder Portefeuille", command=self.save_portfolio)
+        file_menu.add_command(label="Charger Portefeuille", command=self.load_portfolio)
+        file_menu.add_separator()
+        file_menu.add_command(label="Quitter", command=self.root.quit)
+        menubar.add_cascade(label="Fichier", menu=file_menu)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="À propos", command=self.show_about)
+        menubar.add_cascade(label="Aide", menu=help_menu)
+        self.root.config(menu=menubar)
+
+    def show_about(self):
+        messagebox.showinfo("À propos", "Gestion de Portefeuille d'Actions\nVersion 2.0\nDéveloppé avec ttkbootstrap et Tkinter.")
+
+    def save_portfolio(self):
+        if not self.portfolio:
+            messagebox.showwarning("Attention", "Aucun portefeuille à sauvegarder.")
+            return
+        file_path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON files", "*.json")])
+        try:
+            with open(file_path, "w") as f:
+                json.dump(self.portfolio.to_dict(), f, indent=4)
+            messagebox.showinfo("Sauvegarde", f"Portefeuille sauvegardé dans : {file_path}")
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Erreur lors de la sauvegarde : {e}")
+
+    def load_portfolio(self):
+        file_path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+        try:
+            with open(file_path, "r") as f:
+                data = json.load(f)
+            self.portfolio = Portfolio.from_dict(data)
+            self.update_dashboard()
+            self.update_transactions()
+            messagebox.showinfo("Chargement", "Portefeuille chargé avec succès.")
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Erreur lors du chargement : {e}")
+
+
+    def import_csv(self):
+        file_path = filedialog.askopenfilename(
+            filetypes=[("CSV Files", "*.csv"), ("TSV Files", "*.tsv")])
+        if not file_path:
+            return
+
+        if not self.portfolio:
+            self.portfolio = Portfolio(0)
+
+        try:
+            df = pd.read_csv(file_path, sep=None, engine="python")
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Impossible de lire le fichier :\n{e}")
+            return
+
+        required = ["Actif", "Quantité", "Date d'achat"]
+        for col in required:
+            if col not in df.columns:
+                messagebox.showerror("Erreur",
+                    f"Le CSV doit contenir la colonne '{col}'.")
+                return
+
+        for _, row in df.iterrows():
+            symbol = str(row["Actif"]).upper()
+            try:
+                qty = int(row["Quantité"])
+            except ValueError:
+                messagebox.showwarning("Avertissement",
+                    f"Quantité invalide pour {symbol}, ligne ignorée.")
+                continue
+
+            date_str = str(row["Date d'achat"])
+            # Calculer le lendemain pour inclure la date
+            try:
+                dt = datetime.strptime(date_str, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showwarning("Avertissement",
+                    f"Format de date invalide pour {symbol}, ligne ignorée.")
+                continue
+            next_day = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+            # On récupère la clôture du jour demandé
+            ticker = yf.Ticker(symbol)
+            hist = ticker.history(start=date_str, end=next_day)
+            if hist.empty:
+                messagebox.showwarning("Avertissement",
+                    f"Aucune donnée historique pour {symbol} le {date_str}, ligne ignorée.")
+                continue
+
+            purchase_price = hist["Close"].iloc[0]
+            total_cost = purchase_price * qty
+
+            # On stocke dans le portefeuille
+            self.portfolio.assets[symbol] = (
+                qty,
+                purchase_price,
+                purchase_price,
+                date_str
+            )
+            self.portfolio.transactions.append({
+                "date": date_str,
+                "type": "Achat",
+                "symbole": symbol,
+                "quantité": qty,
+                "prix": purchase_price,
+                "total": total_cost
+            })
+
+        self.update_dashboard()
+        self.update_transactions()
+        messagebox.showinfo("Importation réussie",
+                            "Le portefeuille a été importé avec succès\n"
+                            "à partir des prix historiques.")
+
+    # ---------------------- Onglet Dashboard ----------------------
+    def create_dashboard_tab(self):
+        # Partie supérieure : cash et conversion
+        top_frame = ttk.Frame(self.tab_dashboard)
+        top_frame.pack(fill="x", pady=5)
+
+        # Cash frame
+        cash_frame = ttk.Frame(top_frame)
+        cash_frame.pack(side="left", fill="x", expand=True)
+        ttk.Label(cash_frame, text="💰 Cash / Ajout (USD) :").pack(side="left", padx=5)
+        self.cash_entry = ttk.Entry(cash_frame, width=10)
+        self.cash_entry.pack(side="left")
+        self.cash_button = ttk.Button(cash_frame, text="Ajouter/Initialiser", command=self.set_cash)
+        self.cash_button.pack(side="left", padx=5)
+        ToolTip(self.cash_button, "Ajouter ou initialiser le cash disponible")
+        self.label_cash = ttk.Label(cash_frame, text="Cash: 0.0000 USD", font=("Helvetica", 12, "bold"))
+        self.label_cash.pack(side="left", padx=20)
+        self.label_total = ttk.Label(cash_frame, text="Portefeuille: 0.0000 USD", font=("Helvetica", 12, "bold"))
+        self.label_total.pack(side="left", padx=20)
+    
+        # Benchmark frame
+        bench_frame = ttk.Frame(top_frame)
+        bench_frame.pack(side="left", padx=20)
+        ttk.Label(bench_frame, text="Benchmark :").pack(side="left", padx=5)
+        self.entry_benchmark = ttk.Entry(bench_frame, width=8)
+        self.entry_benchmark.pack(side="left")
+        self.button_set_bench = ttk.Button(
+            bench_frame, text="Définir", command=self.set_benchmark
+        )
+        self.button_set_bench.pack(side="left", padx=5)
+        self.label_bench = ttk.Label(bench_frame, text="")   # affichera le ticker en cours
+        self.label_bench.pack(side="left", padx=5)
+    
+
+        # Conversion frame
+        convert_frame = ttk.Frame(top_frame)
+        convert_frame.pack(side="right", padx=5)
+        ttk.Label(convert_frame, text="Montant:").pack(side="left", padx=5)
+        self.entry_amount = ttk.Entry(convert_frame, width=10)
+        self.entry_amount.pack(side="left", padx=5)
+        ttk.Label(convert_frame, text="De:").pack(side="left", padx=5)
+        self.currency_from = tk.StringVar(value="USD")
+        self.option_currency_from = ttk.OptionMenu(convert_frame, self.currency_from, "USD", "USD", "EUR", "GBP", "JPY", "CHF")
+        self.option_currency_from.pack(side="left", padx=5)
+        ttk.Label(convert_frame, text="À:").pack(side="left", padx=5)
+        self.currency_to = tk.StringVar(value="EUR")
+        self.option_currency_to = ttk.OptionMenu(convert_frame, self.currency_to, "EUR", "USD", "EUR", "GBP", "JPY", "CHF")
+        self.option_currency_to.pack(side="left", padx=5)
+        self.button_convert = ttk.Button(convert_frame, text="Convertir", command=self.convert_currency)
+        self.button_convert.pack(side="left", padx=5)
+        self.label_conversion_result = ttk.Label(convert_frame, text="")
+        self.label_conversion_result.pack(side="left", padx=5)
+
+        # Partie inférieure : tableau du portefeuille et graphique camembert
+        bottom_frame = ttk.Frame(self.tab_dashboard)
+        bottom_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        # Tableau du portefeuille
+        portfolio_frame = ttk.Frame(bottom_frame)
+        portfolio_frame.pack(side="left", fill="both", expand=True, padx=5)
+        columns = ("Actif", "Quantité", "Prix d'achat", "Prix actuel", "Valeur", "Date", "Return (%)", "Allocation (%)", "Rel. Return (%)")
+        self.tree_portfolio = ttk.Treeview(portfolio_frame, columns=columns, show="headings")
+        for col in columns:
+            self.tree_portfolio.heading(col, text=col)
+        self.tree_portfolio.pack(fill="both", expand=True)
+        self.tree_portfolio.bind("<Double-1>", self.open_live_chart)
+        self.button_export_assets = ttk.Button(portfolio_frame, text="Exporter Actifs CSV", command=self.export_assets)
+        self.button_export_assets.pack(pady=5)
+
+        # Graphique camembert
+        pie_frame = ttk.Frame(bottom_frame)
+        pie_frame.pack(side="left", fill="both", expand=True, padx=5)
+        self.fig_pie = Figure(figsize=(4,4), dpi=100)
+        self.ax_pie = self.fig_pie.add_subplot(111)
+        self.canvas_pie = FigureCanvasTkAgg(self.fig_pie, master=pie_frame)
+        self.canvas_pie.get_tk_widget().pack(fill="both", expand=True)
+
+    def set_cash(self):
+        try:
+            cash_float = float(self.cash_entry.get())
+            if not self.portfolio:
+                self.portfolio = Portfolio(cash_float)
+            else:
+                self.portfolio.cash += cash_float
+            self.update_dashboard()
+            self.update_transactions()
+        except ValueError:
+            messagebox.showerror("Erreur", "Montant de cash invalide.")
+
+    def export_assets(self):
+        if not self.portfolio or not self.portfolio.assets:
+            messagebox.showwarning("Attention", "Aucun actif à exporter.")
+            return
+        data = []
+        for symbol, (qty, purchase_price, current_price, purchase_date) in self.portfolio.assets.items():
+            data.append({
+                "Actif": symbol,
+                "Quantité": qty,
+                "Prix d'achat": f"{purchase_price:.4f}",
+                "Prix actuel": f"{current_price:.4f}",
+                "Date d'achat": purchase_date
+            })
+        df = pd.DataFrame(data)
+        file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if file_path:
+            df.to_csv(file_path, index=False)
+            messagebox.showinfo("Export", f"Actifs exportés dans : {file_path}")
+
+    # ---------------------- Onglet Transactions ----------------------
+    def create_transactions_tab(self):
+        frame_controls = ttk.Frame(self.tab_transactions)
+        frame_controls.pack(fill="x", pady=5)
+        ttk.Label(frame_controls, text="Acheter:").pack(side="left", padx=5)
+        self.entry_buy_symbol = ttk.Entry(frame_controls, width=8)
+        self.entry_buy_symbol.pack(side="left")
+        ttk.Label(frame_controls, text="Quantité:").pack(side="left", padx=5)
+        self.entry_buy_qty = ttk.Entry(frame_controls, width=5)
+        self.entry_buy_qty.pack(side="left")
+        self.button_buy = ttk.Button(frame_controls, text="Acheter", command=self.buy_stock)
+        self.button_buy.pack(side="left", padx=5)
+        ToolTip(self.button_buy, "Acheter un actif")
+        ttk.Label(frame_controls, text="Vendre:").pack(side="left", padx=15)
+        self.entry_sell_symbol = ttk.Entry(frame_controls, width=8)
+        self.entry_sell_symbol.pack(side="left")
+        ttk.Label(frame_controls, text="Quantité:").pack(side="left", padx=5)
+        self.entry_sell_qty = ttk.Entry(frame_controls, width=5)
+        self.entry_sell_qty.pack(side="left")
+        self.button_sell = ttk.Button(frame_controls, text="Vendre", command=self.sell_stock)
+        self.button_sell.pack(side="left", padx=5)
+        ToolTip(self.button_sell, "Vendre un actif")
+        columns = ("Date", "Type", "Actif", "Quantité", "Prix", "Total")
+        self.tree_transactions = ttk.Treeview(self.tab_transactions, columns=columns, show="headings")
+        for col in columns:
+            self.tree_transactions.heading(col, text=col)
+        self.tree_transactions.pack(fill="both", expand=True, padx=5, pady=5)
+        self.button_export_tx = ttk.Button(self.tab_transactions, text="Exporter CSV", command=self.export_transactions)
+        self.button_export_tx.pack(pady=5)
+        ToolTip(self.button_export_tx, "Exporter l'historique des transactions au format CSV")
+
+    def buy_stock(self):
+        if not self.portfolio:
+            messagebox.showerror("Erreur", "Veuillez ajouter du cash d'abord.")
+            return
+        symbole = self.entry_buy_symbol.get().upper()
+        qty = self.entry_buy_qty.get()
+        if symbole and qty.isdigit():
+            msg = self.portfolio.add_asset(symbole, int(qty))
+            messagebox.showinfo("Transaction", msg)
+            self.update_dashboard()
+            self.update_transactions()
+        else:
+            messagebox.showerror("Erreur", "Informations d'achat invalides.")
+
+    def sell_stock(self):
+        if not self.portfolio:
+            messagebox.showerror("Erreur", "Veuillez ajouter du cash d'abord.")
+            return
+        symbole = self.entry_sell_symbol.get().upper()
+        qty = self.entry_sell_qty.get()
+        if symbole and qty.isdigit():
+            msg = self.portfolio.sell_asset(symbole, int(qty))
+            messagebox.showinfo("Transaction", msg)
+            self.update_dashboard()
+            self.update_transactions()
+        else:
+            messagebox.showerror("Erreur", "Informations de vente invalides.")
+
+    def export_transactions(self):
+        if not self.portfolio or not self.portfolio.transactions:
+            messagebox.showwarning("Attention", "Aucune transaction à exporter.")
+            return
+        df = pd.DataFrame(self.portfolio.transactions)
+        file_path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV files", "*.csv")])
+        if file_path:
+            df.to_csv(file_path, index=False)
+            messagebox.showinfo("Export", f"Transactions exportées dans : {file_path}")
+
+    # ---------------------- Mise à jour du Dashboard ----------------------
+    def update_dashboard(self):
+        if not self.portfolio:
+            return
+        data, cash, total_value = self.portfolio.display_portfolio()
+        # Mise à jour du tableau
+        for item in self.tree_portfolio.get_children():
+            self.tree_portfolio.delete(item)
+        for row in data:
+            symbol        = row[0]
+            qty           = row[1]
+            p_price       = row[2]
+            c_price       = row[3]
+            value         = row[4]
+            purchase_date = row[5]
+            asset_ret     = row[6]       # Return (%) de l’actif
+            alloc_pct     = row[7] if len(row) > 7 else 0  # Allocation (%)
+        
+            # 1) calcul du return du benchmark sur la même période
+            bench_ret = None
+            if hasattr(self, "benchmark"):
+                bench_ret = self.get_benchmark_return(purchase_date)
+        
+            # 2) calcul du return relatif portefeuille - bench
+            if bench_ret is None:
+                rel_ret_str = "N/A"
+            else:
+                rel_ret_str = f"{(asset_ret - bench_ret):.2f}"
+        
+            # 3) on reformate la ligne complète
+            formatted_row = [
+                symbol,
+                qty,
+                f"{p_price:.4f}",
+                f"{c_price:.4f}",
+                f"{value:.4f}",
+                purchase_date,
+                f"{asset_ret:.4f}",
+                f"{alloc_pct:.4f}",
+                rel_ret_str           # la nouvelle colonne
+            ]
+        
+            self.tree_portfolio.insert("", "end", values=formatted_row)
+
+        self.label_cash.config(text=f"Cash: {cash:.4f} USD")
+        self.label_total.config(text=f"Portefeuille: {total_value:.4f} USD")
+        # Mise à jour du graphique camembert
+        self.ax_pie.clear()
+        if total_value > 0:
+            labels = [r[0] for r in data]
+            sizes = [r[4] for r in data]
+            self.ax_pie.pie(sizes, labels=labels, autopct='%1.1f%%', startangle=140)
+        else:
+            self.ax_pie.text(0.5, 0.5, "Aucun actif", horizontalalignment='center')
+        self.canvas_pie.draw()
+
+    def update_transactions(self):
+        if not self.portfolio:
+            return
+        for item in self.tree_transactions.get_children():
+            self.tree_transactions.delete(item)
+        for tx in self.portfolio.transactions:
+            self.tree_transactions.insert("", "end", values=(
+                tx["date"], tx["type"], tx["symbole"], tx["quantité"],
+                f"{tx['prix']:.4f}", f"{tx['total']:.4f}"
+            ))
+
+    # ---------------------- Onglet Analyse ----------------------
+    def create_analysis_tab(self):
+        self.fig_analysis = Figure(figsize=(6,4), dpi=100)
+        self.ax_analysis = self.fig_analysis.add_subplot(111)
+        self.canvas_analysis = FigureCanvasTkAgg(self.fig_analysis, master=self.tab_analysis)
+        self.canvas_analysis.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+
+    def update_analysis_chart(self):
+        self.ax_analysis.clear()
+        if self.portfolio_history:
+            times = [t[0] for t in self.portfolio_history]
+            values = [t[1] for t in self.portfolio_history]
+            self.ax_analysis.plot(times, values, marker='o')
+            self.ax_analysis.set_title("Évolution du portefeuille (live)")
+        self.canvas_analysis.draw()
+
+    def open_live_chart(self, event):
+        selected = self.tree_portfolio.selection()
+        if not selected:
+            return
+        symbole = self.tree_portfolio.item(selected, 'values')[0]
+        win = tk.Toplevel(self.root)
+        win.title(f"Graphique en direct de {symbole}")
+        win.geometry("700x500")
+        fig_live = Figure(figsize=(7,5), dpi=100)
+        ax_live = fig_live.add_subplot(111)
+        canvas_live = FigureCanvasTkAgg(fig_live, master=win)
+        canvas_live.get_tk_widget().pack(fill="both", expand=True)
+
+        def update_live():
+            ticker = yf.Ticker(symbole)
+            data = ticker.history(period="1d", interval="1m")
+            if not data.empty:
+                ax_live.clear()
+                ax_live.plot(data.index, data["Close"], marker='o', linestyle='-')
+                ax_live.set_title(f"{symbole} (mise à jour en direct)")
+                ax_live.set_xlabel("Heure")
+                ax_live.set_ylabel("Prix (USD)")
+                fig_live.autofmt_xdate()
+                canvas_live.draw()
+            win.after(5000, update_live)
+        update_live()
+
+    # ---------------------- Onglet Données Historiques ----------------------
+    def create_histdata_tab(self):
+        frm_hist = ttk.Frame(self.tab_histdata)
+        frm_hist.pack(pady=5)
+        ttk.Label(frm_hist, text="Symbole:").grid(row=0, column=0, padx=5)
+        self.entry_hist_symbol = ttk.Entry(frm_hist, width=10)
+        self.entry_hist_symbol.grid(row=0, column=1, padx=5)
+        ttk.Label(frm_hist, text="Début (YYYY-MM-DD):").grid(row=0, column=2, padx=5)
+        self.entry_hist_start = ttk.Entry(frm_hist, width=12)
+        self.entry_hist_start.grid(row=0, column=3, padx=5)
+        ttk.Label(frm_hist, text="Fin (YYYY-MM-DD):").grid(row=0, column=4, padx=5)
+        self.entry_hist_end = ttk.Entry(frm_hist, width=12)
+        self.entry_hist_end.grid(row=0, column=5, padx=5)
+        self.button_hist = ttk.Button(frm_hist, text="Afficher", command=self.fetch_historical_data)
+        self.button_hist.grid(row=0, column=6, padx=5)
+        ToolTip(self.button_hist, "Afficher les données historiques pour le symbole")
+        self.button_candle = ttk.Button(frm_hist, text="Candlestick", command=self.show_candlestick)
+        self.button_candle.grid(row=0, column=7, padx=5)
+        ToolTip(self.button_candle, "Afficher le graphique en chandeliers (candlestick)")
+        self.fig_hist = Figure(figsize=(6,4), dpi=100)
+        self.ax_hist = self.fig_hist.add_subplot(111)
+        self.canvas_hist = FigureCanvasTkAgg(self.fig_hist, master=self.tab_histdata)
+        self.canvas_hist.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+
+    def fetch_historical_data(self):
+        symbole = self.entry_hist_symbol.get().upper()
+        debut = self.entry_hist_start.get()
+        fin = self.entry_hist_end.get()
+        if not symbole or not debut or not fin:
+            messagebox.showerror("Erreur", "Veuillez renseigner tous les champs.")
+            return
+        ticker = yf.Ticker(symbole)
+        data = ticker.history(start=debut, end=fin)
+        self.ax_hist.clear()
+        if not data.empty:
+            self.ax_hist.plot(data.index, data["Close"], marker='o')
+            self.ax_hist.set_title(f"{symbole} du {debut} au {fin}")
+            self.ax_hist.set_xlabel("Date")
+            self.ax_hist.set_ylabel("Prix (USD)")
+        else:
+            self.ax_hist.text(0.5, 0.5, "Pas de données", horizontalalignment='center')
+        self.canvas_hist.draw()
+
+    def show_candlestick(self):
+        if mpf is None:
+            messagebox.showerror("Erreur", "mplfinance n'est pas installé.")
+            return
+        symbole = self.entry_hist_symbol.get().upper()
+        debut = self.entry_hist_start.get()
+        fin = self.entry_hist_end.get()
+        if not symbole or not debut or not fin:
+            messagebox.showerror("Erreur", "Veuillez renseigner tous les champs pour le candlestick.")
+            return
+        ticker = yf.Ticker(symbole)
+        data = ticker.history(start=debut, end=fin)
+        if data.empty:
+            messagebox.showerror("Erreur", "Pas de données pour le symbole.")
+            return
+        win = tk.Toplevel(self.root)
+        win.title(f"Candlestick - {symbole}")
+        fig_candle = Figure(figsize=(7,5), dpi=100)
+        canvas_candle = FigureCanvasTkAgg(fig_candle, master=win)
+        canvas_candle.get_tk_widget().pack(fill="both", expand=True)
+        try:
+            ax = fig_candle.add_subplot(111)
+            mpf.plot(data, type='candle', ax=ax, style='yahoo', volume=False)
+            canvas_candle.draw()
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Erreur lors de l'affichage du candlestick : {e}")
+
+    # ---------------------- Onglet Performance ----------------------
+    def create_performance_tab(self):
+        frm_perf = ttk.Frame(self.tab_performance)
+        frm_perf.pack(pady=5, padx=5, fill="x")
+        ttk.Label(frm_perf, text="Période d'analyse (YYYY-MM-DD):").grid(row=0, column=0, padx=5, pady=5)
+        ttk.Label(frm_perf, text="Début:").grid(row=0, column=1, padx=5)
+        self.entry_perf_start = ttk.Entry(frm_perf, width=12)
+        self.entry_perf_start.grid(row=0, column=2, padx=5)
+        ttk.Label(frm_perf, text="Fin:").grid(row=0, column=3, padx=5)
+        self.entry_perf_end = ttk.Entry(frm_perf, width=12)
+        self.entry_perf_end.grid(row=0, column=4, padx=5)
+        self.button_perf = ttk.Button(frm_perf, text="Calculer Performance", command=self.compute_performance)
+        self.button_perf.grid(row=0, column=5, padx=5)
+        ToolTip(self.button_perf, "Calculer les indicateurs de performance du portefeuille")
+        self.text_perf = tk.Text(self.tab_performance, height=8)
+        self.text_perf.pack(fill="x", padx=5, pady=5)
+        self.fig_perf = Figure(figsize=(6,4), dpi=100)
+        self.ax_perf = self.fig_perf.add_subplot(111)
+        self.canvas_perf = FigureCanvasTkAgg(self.fig_perf, master=self.tab_performance)
+        self.canvas_perf.get_tk_widget().pack(fill="both", expand=True, padx=5, pady=5)
+
+        self.ax_perf = self.fig_perf.add_subplot(111)
+        self.ax_perf.set_title("Rendement cumulatif du portefeuille et du benchmark")
+        self.ax_perf.set_xlabel("Date")
+        self.ax_perf.set_ylabel("Rendement cumulatif")
+
+    def compute_performance(self):
+        if not self.portfolio or not self.portfolio.assets:
+            messagebox.showwarning("Attention", "Aucun portefeuille ou actif à analyser.")
+            return
+        start_date = self.entry_perf_start.get()
+        end_date   = self.entry_perf_end.get()
+        # … vos validations de dates inchangées …
+
+        # --- 1) Séries de retour quotidiennes du portefeuille ---
+        returns_df = pd.DataFrame()
+        weights = {}
+        total_initial_value = 0
+        for symbol, (qty, _, _, _) in self.portfolio.assets.items():
+            hist = yf.Ticker(symbol).history(start=start_date, end=end_date)
+            if hist.empty: continue
+            prices = hist["Close"]
+            initial_value = qty * prices.iloc[0]
+            weights[symbol] = initial_value
+            total_initial_value += initial_value
+            returns_df[symbol] = prices.pct_change()
+        if returns_df.empty:
+            messagebox.showerror("Erreur", "Pas de données historiques pour les actifs.")
+            return
+        # pondération
+        for s in weights: weights[s] /= total_initial_value
+        port_daily = returns_df.apply(lambda row: sum(row[s]*w for s,w in weights.items() if pd.notna(row[s])), axis=1).dropna()
+        # cumul
+        port_cum = (1 + port_daily).cumprod() - 1
+
+        # --- 2) Séries de retour du benchmark ---
+        bench_cum = None
+        if hasattr(self, "benchmark"):
+            hist_b = yf.Ticker(self.benchmark).history(start=start_date, end=end_date)
+            if not hist_b.empty:
+                bench_daily = hist_b["Close"].pct_change().reindex(port_cum.index).dropna()
+                bench_cum   = (1 + bench_daily).cumprod() - 1
+
+        # --- 3) Calculs statistiques ---
+        cumulative = port_cum.iloc[-1]
+        ann_return = (1 + cumulative)**(252/len(port_daily)) - 1
+        ann_vol    = port_daily.std()*math.sqrt(252)
+        sharpe     = ann_return/ann_vol if ann_vol else np.nan
+
+        # metrics bench
+        info_ratio = tracking_error = alpha = None
+        if bench_cum is not None:
+            alpha = cumulative - bench_cum.iloc[-1]
+            diff_daily = port_daily.reindex(bench_daily.index) - bench_daily
+            tracking_error = diff_daily.std()*math.sqrt(252)
+            info_ratio = alpha / tracking_error if tracking_error else np.nan
+
+        # --- 4) Affichage textuel ---
+        txt = (
+            f"Portefeuille :\n"
+            f"  ➤ Rendement cumulatif   : {cumulative*100:.2f}%\n"
+            f"  ➤ Rendement annualisé   : {ann_return*100:.2f}%\n"
+            f"  ➤ Volatilité annualisée : {ann_vol*100:.2f}%\n"
+            f"  ➤ Sharpe ratio          : {sharpe:.2f}\n"
+        )
+        if bench_cum is not None:
+            txt += (
+                f"\nBenchmark ({self.benchmark}) :\n"
+                f"  ➤ Rendement cumulatif   : {bench_cum.iloc[-1]*100:.2f}%\n"
+                f"\nComparaison :\n"
+                f"  ➤ Alpha (excess return) : {alpha*100:.2f}%\n"
+                f"  ➤ Tracking Error        : {tracking_error*100:.2f}%\n"
+                f"  ➤ Information Ratio     : {info_ratio:.2f}\n"
+            )
+        self.text_perf.delete("1.0", tk.END)
+        self.text_perf.insert(tk.END, txt)
+
+        # --- 5) Tracé des courbes ---
+        self.ax_perf.clear()
+        self.ax_perf.plot(port_cum.index, port_cum.values, label="Portefeuille")
+        if bench_cum is not None:
+            self.ax_perf.plot(bench_cum.index, bench_cum.values, label=self.benchmark)
+        self.ax_perf.legend()
+        self.fig_perf.autofmt_xdate()
+        self.canvas_perf.draw()
+
+        
+        
+    # ---------------------- Onglet Graphiques ----------------------
+    def create_breakdown_tab(self):
+        frm = ttk.Frame(self.tab_breakdown)
+        frm.pack(side="top", fill="x", padx=10, pady=10)
+
+        ttk.Label(frm, text="Choisir un graphique :").grid(row=0, column=0, sticky="w")
+
+        # StringVar + trace
+        self.breakdown_var = tk.StringVar(value="Allocation")
+        self.breakdown_var.trace("w", lambda *args: self.update_breakdown_chart())
+
+        opts = [
+            "Allocation",
+            "Rendement cumulé",
+            "Pays",
+            "Secteurs",
+            "Corrélations",
+            "Histogramme rendements",
+            "Risk vs Return",
+            "Allocation dans le temps",
+            "Sharpe mobile",
+        ]
+        self.option_breakdown = tk.OptionMenu(frm, self.breakdown_var, *opts)
+        self.option_breakdown.grid(row=0, column=1, padx=5)
+
+        self.btn_pdf = ttk.Button(frm, text="Générer PDF", command=self.generate_pdf)
+        self.btn_pdf.grid(row=0, column=2, padx=20)
+
+        # Zone de tracé
+        self.fig_breakdown = Figure(figsize=(8,6), dpi=100)
+        self.ax_breakdown = self.fig_breakdown.add_subplot(111)
+        self.canvas_breakdown = FigureCanvasTkAgg(
+            self.fig_breakdown, master=self.tab_breakdown
+        )
+        self.canvas_breakdown.get_tk_widget().pack(
+            fill="both", expand=True, padx=5, pady=5
+        )
+
+        # Affichage initial
+        self.update_breakdown_chart()
+        
+    
+    def update_breakdown_chart(self, choice=None):
+        if not self.portfolio:
+            return
+    
+        # 1) Choix de l’affichage
+        choice = self.breakdown_var.get()
+    
+        # 2) S’assure que le cache est construit
+        self.init_breakdown_cache()   # ton implémentation précédente
+        cache = self.breakdown_cache  # dict : sym → { "hist", "returns", "country", "sector", "value" }
+    
+        # 3) Reset complet de la figure/axe
+        self.fig_breakdown.clf()
+        ax = self.fig_breakdown.add_subplot(111)
+    
+        # 4) Construit port_series & port_returns
+        port_series = pd.concat([data["hist"]["Close"] * data["value"] / data["hist"]["Close"].iloc[-1]
+                                 for data in cache.values()], axis=1).sum(axis=1)
+        port_returns = port_series.pct_change()
+    
+        # 5) Rendements par actif
+        returns_df = pd.DataFrame({sym: data["returns"] for sym, data in cache.items()})
+    
+        # 6) Benchmark si défini
+        bench_series = bench_returns = None
+        if hasattr(self, "benchmark") and self.benchmark:
+            start_b = port_series.index.min().strftime("%Y-%m-%d")
+            bh = yf.Ticker(self.benchmark).history(start=start_b)
+            if not bh.empty:
+                bench_series  = bh["Close"]
+                bench_returns = bench_series.pct_change()
+    
+        # ==== Allocation par actif ====
+        if choice == "Allocation":
+            labels = list(cache.keys())
+            sizes  = [data["value"] for data in cache.values()]
+            ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=140)
+            ax.set_title("Répartition du portefeuille")
+    
+        # ==== Rendement cumulatif ====
+        elif choice == "Rendement cumulé":
+            for sym, data in cache.items():
+                hist = data["hist"]
+                cum  = hist["Close"] / hist["Close"].iloc[0] - 1
+                ax.plot(cum.index, cum.values, label=sym)
+            ax.set_title("Rendement cumulatif depuis l'achat")
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Rendement cumulatif")
+            ax.legend(fontsize="small")
+            self.fig_breakdown.autofmt_xdate()
+    
+        # ==== Pays ====
+        elif choice == "Pays":
+            vals = {}
+            for data in cache.values():
+                c = data["country"]
+                vals[c] = vals.get(c, 0) + data["value"]
+            labels, sizes = zip(*vals.items())
+            ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=140)
+            ax.set_title("Allocation par pays")
+    
+        # ==== Secteurs ====
+        elif choice == "Secteurs":
+            vals = {}
+            for data in cache.values():
+                s = data["sector"]
+                vals[s] = vals.get(s, 0) + data["value"]
+            labels, sizes = zip(*vals.items())
+            ax.pie(sizes, labels=labels, autopct="%1.1f%%", startangle=140)
+            ax.set_title("Allocation sectorielle")
+    
+        # ==== Corrélations ====
+        elif choice == "Corrélations":
+            corr = returns_df.corr()
+            im   = ax.imshow(corr, vmin=-1, vmax=1, cmap="coolwarm")
+            self.fig_breakdown.colorbar(im, ax=ax)
+            ticks = range(len(corr))
+            ax.set_xticks(ticks); ax.set_yticks(ticks)
+            ax.set_xticklabels(corr.columns, rotation=90)
+            ax.set_yticklabels(corr.index)
+            ax.set_title("Heatmap des corrélations")
+    
+
+    
+        # ==== Histogramme rendements ====
+        elif choice == "Histogramme rendements":
+            pr = port_returns.dropna()
+            ax.hist(pr, bins=30, alpha=0.7, label="Portefeuille")
+            if bench_returns is not None:
+                br = bench_returns.dropna()
+                ax.hist(br, bins=30, histtype="step", label=self.benchmark)
+            ax.set_title("Histogramme des rendements quotidiens")
+            ax.legend(fontsize="small")
+    
+        # ==== Risk vs Return ====
+        elif choice == "Risk vs Return":
+            mu    = returns_df.mean() * 252
+            sigma = returns_df.std()  * math.sqrt(252)
+            for sym in mu.index:
+                ax.scatter(sigma[sym], mu[sym], s=20)
+                ax.text(sigma[sym], mu[sym], sym)
+            if bench_returns is not None:
+                mu_b    = bench_returns.mean() * 252
+                sigma_b = bench_returns.std()  * math.sqrt(252)
+                slope   = mu_b / sigma_b if sigma_b else 0
+                xs      = np.linspace(0, sigma.max(), 100)
+                ys      = slope * xs
+                ax.plot(xs, ys, "--", label="SML")
+                ax.scatter([sigma_b], [mu_b], c="red", label=self.benchmark)
+                ax.legend(fontsize="small")
+            ax.set_xlabel("Volatilité annualisée")
+            ax.set_ylabel("Rendement annualisé")
+            ax.set_title("Risk vs Return")
+    
+        # ==== Allocation dans le temps ====
+        elif choice == "Allocation dans le temps":
+            dates = sorted({d for data in cache.values() for d in data["hist"].index})
+            sector_times = {}
+            for sym, data in cache.items():
+                try:
+                    sector = yf.Ticker(sym).info.get("sector","Inconnu")
+                except:
+                    sector = "Inconnu"
+                series = data["hist"]["Close"] * (data["value"] / data["hist"]["Close"].iloc[-1])
+                sector_times.setdefault(sector, pd.Series(0, index=dates))
+                sector_times[sector] = sector_times[sector].add(
+                    series.reindex(dates, fill_value=0), fill_value=0
+                )
+            df_sec = pd.DataFrame(sector_times, index=dates)
+            ax.stackplot(df_sec.index, df_sec.T.values, labels=df_sec.columns)
+            ax.legend(loc="upper left", fontsize="small")
+            ax.set_title("Allocation sectorielle dans le temps")
+            self.fig_breakdown.autofmt_xdate()
+    
+        # ==== Sharpe mobile ====
+        elif choice == "Sharpe mobile":
+            w = 90
+            p_sr = (port_returns.rolling(w).mean() / port_returns.rolling(w).std()) * math.sqrt(252)
+            ax.plot(p_sr.index, p_sr.values, label="Portefeuille")
+            if bench_returns is not None:
+                b_sr = (bench_returns.rolling(w).mean() / bench_returns.rolling(w).std()) * math.sqrt(252)
+                ax.plot(b_sr.index, b_sr.values, label=self.benchmark)
+            ax.set_title("Sharpe ratio mobile (90 jours)")
+            ax.legend(fontsize="small")
+            self.fig_breakdown.autofmt_xdate()
+    
+        # === Rafraîchissement ===
+        self.canvas_breakdown.draw_idle()
+       
+    
+    
+    def generate_pdf(self):
+        """Génère un rapport PDF 9 pages, sans interrompre si une page échoue."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".pdf",
+            filetypes=[("PDF files", "*.pdf")],
+            title="Enregistrer le rapport PDF"
+        )
+        if not path:
+            return
+    
+        # --- Préparation des données communes ---
+        try:
+            self.init_breakdown_cache()
+            cache = self.breakdown_cache
+    
+            # Série totale portefeuille
+            port_series = pd.concat(
+                [d["hist"]["Close"] * d["value"] / d["hist"]["Close"].iloc[0]
+                 for d in cache.values()],
+                axis=1
+            ).sum(axis=1)
+            port_returns = port_series.pct_change().dropna()
+    
+            # Benchmark si défini
+            bench_series = bench_returns = None
+            if getattr(self, "benchmark", None):
+                start_b = port_series.index.min().strftime("%Y-%m-%d")
+                bh = yf.Ticker(self.benchmark).history(start=start_b)
+                if not bh.empty:
+                    bench_series = bh["Close"]
+                    bench_returns = bench_series.pct_change().dropna()
+    
+            # Rendements par actif
+            returns_df = pd.DataFrame({
+                sym: d["hist"]["Close"].pct_change().dropna()
+                for sym, d in cache.items()
+            }).dropna(axis=1, how="all")
+        except Exception as e:
+            messagebox.showwarning("PDF", f"Erreur préparation données : {e}")
+            cache = {}
+            port_series = pd.Series(dtype=float)
+            port_returns = pd.Series(dtype=float)
+            bench_series = bench_returns = None
+            returns_df = pd.DataFrame()
+    
+        with PdfPages(path) as pdf:
+            # --- Page 1 : Titre ---
+            try:
+                fig = plt.figure(figsize=(8.27,11.69))
+                ax = fig.add_subplot(111); ax.axis("off")
+                ax.text(0.5, 0.6, "CYGIF Asset Management",
+                        ha="center", va="center", fontsize=24, weight="bold")
+                ax.text(0.5, 0.4, "Executive Summary",
+                        ha="center", va="center", fontsize=18)
+                pdf.savefig(fig); plt.close(fig)
+            except Exception as e:
+                print("Page 1 erreur:", e)
+        
+            # --- Page 2 : Détail complet du Dashboard + total ---
+            try:
+                data, cash, total_value = self.portfolio.display_portfolio()
+                # ON PREND BIEN 8 COLONNES
+                df = pd.DataFrame(data, columns=[
+                    "Actif", "Quantité", "Prix d'achat", "Prix actuel",
+                    "Valeur", "Date d'achat", "Return %", "Allocation %"
+                ])
+                # On arrondit et on prépare df2
+                df2 = df[["Actif", "Valeur", "Return %", "Allocation %"]].round(2)
+                # Ajout de la ligne Total
+                total = df["Valeur"].sum()
+                alloc_total = df["Allocation %"].sum()
+                df2 = df2.append({
+                    "Actif": "Total", 
+                    "Valeur": f"{total:.2f}",
+                    "Return %": "",
+                    "Allocation %": f"{alloc_total:.2f}"
+                }, ignore_index=True)
+    
+                fig, ax = plt.subplots(figsize=(8.27,11.69))
+                ax.axis("off")
+                tbl = ax.table(
+                    cellText=df2.values,
+                    colLabels=df2.columns,
+                    cellLoc="center",
+                    loc="center"
+                )
+                tbl.auto_set_font_size(False)
+                tbl.set_fontsize(8)
+                tbl.scale(1, 1.5)
+                ax.set_title("Détail du portefeuille (Dashboard)", pad=20, fontsize=14)
+    
+                pdf.savefig(fig)
+                plt.close(fig)
+            except Exception as e:
+                print("Page 2 erreur:", e)
+    
+            # --- Page 3 : Positions détaillées ---
+            try:
+                data, cash, total_value = self.portfolio.display_portfolio()
+                df = pd.DataFrame(data, columns=[
+                    "Actif", "Quantité", "Prix d'achat", "Prix actuel",
+                    "Valeur", "Date d'achat", "Return %", "Allocation %"
+                ])
+                df2 = df[["Actif", "Valeur", "Return %", "Allocation %"]].round(2)
+    
+                fig, ax = plt.subplots(figsize=(8.27,11.69))
+                ax.axis("off")
+                tbl = ax.table(
+                    cellText=df2.values,
+                    colLabels=df2.columns,
+                    cellLoc="center",
+                    loc="center"
+                )
+                tbl.auto_set_font_size(False)
+                tbl.set_fontsize(8)
+                tbl.scale(1, 1.5)
+                ax.set_title("Positions du portefeuille", pad=20)
+    
+                pdf.savefig(fig)
+                plt.close(fig)
+            except Exception as e:
+                print("Page 3 erreur:", e)
+    
+        
+            # --- Page 4 : Performance summary (%) + cumul ---
+            try:
+                # Metrics
+                today = port_series.index[-1] if not port_series.empty else None
+                metrics = {}
+                for label, delta in [
+                    ("YTD", pd.Timestamp(today).replace(month=1,day=1)),
+                    ("1Y", pd.Timestamp(today) - pd.DateOffset(years=1)),
+                    ("5Y", pd.Timestamp(today) - pd.DateOffset(years=5))
+                ]:
+                    metrics[label] = (
+                        port_series.iloc[-1]/port_series.loc[delta] -1
+                        if port_series.notna().any() and delta in port_series.index else None
+                    )
+                ann_ret = ( (1+port_returns).prod()**(252/len(port_returns)) -1
+                            if len(port_returns)>1 else None)
+                ann_vol = port_returns.std()*math.sqrt(252) if not port_returns.empty else None
+                sharpe = ann_ret/ann_vol if ann_vol else None
+                te = ((port_returns - bench_returns).std()*math.sqrt(252)
+                      if bench_returns is not None else None)
+                rel_perf = (
+                    (port_series.iloc[-1]/port_series.iloc[0])/
+                    (bench_series.iloc[-1]/bench_series.iloc[0]) -1
+                    if bench_series is not None and not port_series.empty else None
+                )
+                metrics.update({
+                    "Ann. Return":ann_ret, "Ann. Vol":ann_vol,
+                    "Sharpe":sharpe, "Tracking Err":te, "Rel. Perf":rel_perf
+                })
+                perf_df = pd.DataFrame([{k:(v*100 if v is not None else None)
+                                         for k,v in metrics.items()}]).round(2)
+    
+                # Tableau metrics
+                fig, ax = plt.subplots(figsize=(8.27,5))
+                ax.axis("off")
+                tbl = ax.table(cellText=perf_df.values, colLabels=perf_df.columns,
+                               cellLoc="center", loc="center")
+                tbl.auto_set_font_size(False); tbl.set_fontsize(10); tbl.scale(1,2)
+                ax.set_title("Performance summary (%)", pad=20)
+                pdf.savefig(fig); plt.close(fig)
+    
+                # Graph cumul
+                fig, ax = plt.subplots(figsize=(8.27,5))
+                cum_p = port_series/port_series.iloc[0] -1 if not port_series.empty else pd.Series()
+                ax.plot(cum_p.index, cum_p.values, label="Portefeuille")
+                if bench_series is not None:
+                    cum_b = bench_series/bench_series.iloc[0] -1
+                    ax.plot(cum_b.index, cum_b.values, label=self.benchmark)
+                ax.set_title("Performance cumulée", pad=20); ax.legend(fontsize="small")
+                pdf.savefig(fig); plt.close(fig)
+            except Exception as e:
+                print("Page 4 erreur:", e)
+    
+            # --- Page 5 : Allocation / Pays / Secteurs (plus lisibles) ---
+            try:
+                df_pos = pd.DataFrame({
+                    "Actif": list(cache.keys()),
+                    "Valeur":[d["value"] for d in cache.values()],
+                    "Pays":[d["country"] for d in cache.values()],
+                    "Secteur":[d["sector"] for d in cache.values()]
+                })
+                fig, axes = plt.subplots(1,3,figsize=(16,6))
+                axes[0].pie(df_pos["Valeur"], labels=df_pos["Actif"],
+                            autopct="%1.1f%%", textprops={"fontsize":8})
+                axes[0].set_title("Allocation")
+                cv = df_pos.groupby("Pays")["Valeur"].sum()
+                axes[1].pie(cv, labels=cv.index,
+                            autopct="%1.1f%%", textprops={"fontsize":8})
+                axes[1].set_title("Pays")
+                sv = df_pos.groupby("Secteur")["Valeur"].sum()
+                axes[2].pie(sv, labels=sv.index,
+                            autopct="%1.1f%%", textprops={"fontsize":8})
+                axes[2].set_title("Secteurs")
+                pdf.savefig(fig); plt.close(fig)
+            except Exception as e:
+                print("Page 5 erreur:", e)
+    
+            # --- Page 6 : Allocation dans le temps & Rendement cumulatif ---
+            try:
+                dates = sorted({d for d in cache.values() for d in d["hist"].index})
+                sector_times = {}
+                for d in cache.values():
+                    sec = d["sector"]
+                    series = d["hist"]["Close"] * (d["value"]/d["hist"]["Close"].iloc[0])
+                    sector_times.setdefault(sec, pd.Series(0,index=dates))
+                    sector_times[sec] = sector_times[sec].add(
+                        series.reindex(dates,fill_value=0), fill_value=0
+                    )
+                df_sec = pd.DataFrame(sector_times,index=dates)
+    
+                fig, (ax1,ax2) = plt.subplots(2,1,figsize=(8.27,11.69))
+                ax1.stackplot(df_sec.index, df_sec.T.values, labels=df_sec.columns)
+                ax1.set_title("Allocation dans le temps"); ax1.legend(fontsize="small")
+                for sym,d in cache.items():
+                    cum = d["hist"]["Close"]/d["hist"]["Close"].iloc[0] - 1
+                    ax2.plot(cum.index, cum.values, label=sym)
+                ax2.set_title("Rendement cumulatif"); ax2.legend(fontsize="small")
+                pdf.savefig(fig); plt.close(fig)
+            except Exception as e:
+                print("Page 6 erreur:", e)
+    
+            # --- Page 7 : Corrélations + VaR & Drawdown & Volatilité ---
+            try:
+                corr = returns_df.corr()
+                dd = port_series/port_series.cummax() - 1
+                var95 = port_returns.quantile(0.05)
+                vol = port_returns.std()*math.sqrt(252)
+    
+                fig = plt.figure(figsize=(8.27,11.69))
+                gs = fig.add_gridspec(2,1, height_ratios=[2,1])
+                axc = fig.add_subplot(gs[0,0])
+                axt = fig.add_subplot(gs[1,0])
+    
+                im = axc.imshow(corr,vmin=-1,vmax=1,cmap="coolwarm")
+                fig.colorbar(im, ax=axc); axc.set_title("Corrélations")
+    
+                axt.axis("off")
+                risk_df = pd.DataFrame([{
+                    "VaR 95%":f"{var95:.2%}",
+                    "Max Drawdown":f"{dd.min():.2%}",
+                    "Ann. Volatilité":f"{vol:.2%}"
+                }])
+                tbl = axt.table(cellText=risk_df.values,
+                                colLabels=risk_df.columns,
+                                cellLoc="center", loc="center")
+                tbl.auto_set_font_size(False); tbl.set_fontsize(12); tbl.scale(1,2)
+    
+                pdf.savefig(fig); plt.close(fig)
+            except Exception as e:
+                print("Page 7 erreur:", e)
+    
+
+            # --- Page 8 : Analyse Risk Reward + SML en grand ---
+            try:
+                fig, ax = plt.subplots(figsize=(8.27,11.69))
+                mu = returns_df.mean()*252
+                sigma = returns_df.std()*math.sqrt(252)
+                for sym in mu.index:
+                    ax.scatter(sigma[sym], mu[sym], s=50); ax.text(sigma[sym],mu[sym],sym)
+                if bench_returns is not None:
+                    mu_b = bench_returns.mean()*252
+                    sigma_b = bench_returns.std()*math.sqrt(252)
+                    slope = mu_b/sigma_b if sigma_b else 0
+                    xs = np.linspace(0, sigma.max(), 100)
+                    ys = slope*xs
+                    ax.plot(xs, ys, "-", label="Security Market Line", linewidth=2)
+                    ax.scatter([sigma_b],[mu_b], c="red", label=self.benchmark, s=50)
+                    ax.legend(fontsize="small")
+                ax.set_title("Analyse Risk Reward", pad=20)
+                ax.set_xlabel("Volatilité annualisée"); ax.set_ylabel("Rendement annualisé")
+                pdf.savefig(fig); plt.close(fig)
+            except Exception as e:
+                print("Page 8 erreur:", e)
+    
+        messagebox.showinfo("PDF généré", f"Rapport enregistré ⇒\n{path}")
+
+    # ---------------------- Onglet Paramètres ----------------------
+    def create_settings_tab(self):
+        frm_settings = ttk.Frame(self.tab_settings)
+        frm_settings.pack(pady=10, padx=10, fill="x")
+        ttk.Label(frm_settings, text="Intervalle de mise à jour (sec):").grid(row=0, column=0, padx=5, pady=5, sticky="w")
+        self.spin_interval = ttk.Spinbox(frm_settings, from_=1, to=60, width=5, command=self.update_interval_setting)
+        self.spin_interval.set(5)
+        self.spin_interval.grid(row=0, column=1, padx=5, pady=5, sticky="w")
+        ttk.Label(frm_settings, text="Thème:").grid(row=1, column=0, padx=5, pady=5, sticky="w")
+        self.theme_options = ["darkly", "flatly", "cyborg", "litera", "journal", "solar", "vapor"]
+        self.theme_var = tk.StringVar(value="darkly")
+        self.option_theme = ttk.OptionMenu(frm_settings, self.theme_var, "darkly", *self.theme_options, command=self.change_theme)
+        self.option_theme.grid(row=1, column=1, padx=5, pady=5, sticky="w")
+        ttk.Label(frm_settings, text="Alertes").grid(row=2, column=0, padx=5, pady=10, sticky="w")
+        ttk.Label(frm_settings, text="Symbole:").grid(row=3, column=0, padx=5)
+        self.entry_alert_symbol = ttk.Entry(frm_settings, width=8)
+        self.entry_alert_symbol.grid(row=3, column=1, padx=5)
+        ttk.Label(frm_settings, text="Seuil:").grid(row=3, column=2, padx=5)
+        self.entry_alert_threshold = ttk.Entry(frm_settings, width=8)
+        self.entry_alert_threshold.grid(row=3, column=3, padx=5)
+        ttk.Label(frm_settings, text="Condition:").grid(row=3, column=4, padx=5)
+        self.alert_condition = tk.StringVar(value="above")
+        self.option_alert = ttk.OptionMenu(frm_settings, self.alert_condition, "above", "above", "below")
+        self.option_alert.grid(row=3, column=5, padx=5)
+        self.button_add_alert = ttk.Button(frm_settings, text="Ajouter alerte", command=self.add_alert)
+        self.button_add_alert.grid(row=3, column=6, padx=5)
+        ToolTip(self.button_add_alert, "Ajouter une alerte sur un actif")
+        self.listbox_alerts = tk.Listbox(frm_settings, height=4)
+        self.listbox_alerts.grid(row=4, column=0, columnspan=4, padx=5, pady=5, sticky="we")
+        self.button_remove_alert = ttk.Button(frm_settings, text="Supprimer alerte", command=self.remove_alert)
+        self.button_remove_alert.grid(row=4, column=4, padx=5)
+        ToolTip(self.button_remove_alert, "Supprimer l'alerte sélectionnée")
+        csv_frame = ttk.Frame(frm_settings)
+        csv_frame.grid(row=5, column=0, columnspan=4, pady=10, sticky="w")
+        self.button_import_csv = ttk.Button(csv_frame, text="Importer CSV", command=self.import_csv)
+        self.button_import_csv.pack(side="left", padx=5)
+        ToolTip(self.button_import_csv, "Importer un portefeuille depuis un fichier CSV")
+
+    def update_interval_setting(self):
+        try:
+            sec = int(self.spin_interval.get())
+            self.update_interval = sec * 1000
+        except ValueError:
+            pass
+
+    def change_theme(self, theme):
+        self.root.style.theme_use(theme)
+
+    def add_alert(self):
+        symbole = self.entry_alert_symbol.get().upper()
+        try:
+            seuil = float(self.entry_alert_threshold.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Seuil invalide.")
+            return
+        condition = self.alert_condition.get()
+        if symbole:
+            alert = {"symbole": symbole, "seuil": seuil, "condition": condition}
+            self.alerts.append(alert)
+            self.listbox_alerts.insert("end", f"{symbole} {condition} {seuil:.4f}")
+        else:
+            messagebox.showerror("Erreur", "Symbole invalide.")
+
+    def remove_alert(self):
+        selection = self.listbox_alerts.curselection()
+        if selection:
+            index = selection[0]
+            self.listbox_alerts.delete(index)
+            del self.alerts[index]
+
+    def check_alerts(self):
+        for alert in self.alerts:
+            ticker = yf.Ticker(alert["symbole"])
+            data = ticker.history(period="1d")
+            if data.empty:
+                continue
+            price = data["Close"].iloc[-1]
+            if alert["condition"] == "above" and price >= alert["seuil"]:
+                messagebox.showinfo("Alerte", f"{alert['symbole']} est au-dessus de {alert['seuil']:.4f} (actuel: {price:.4f} USD)")
+            elif alert["condition"] == "below" and price <= alert["seuil"]:
+                messagebox.showinfo("Alerte", f"{alert['symbole']} est en-dessous de {alert['seuil']:.4f} (actuel: {price:.4f} USD)")
+
+    # ---------------------- Méthode de Conversion de devises ----------------------
+    def convert_currency(self):
+        try:
+            amount = float(self.entry_amount.get())
+        except ValueError:
+            messagebox.showerror("Erreur", "Montant invalide.")
+            return
+
+        from_currency = self.currency_from.get()
+        to_currency = self.currency_to.get()
+
+        if from_currency == to_currency:
+            converted = amount
+        else:
+            try:
+                if from_currency == "USD":
+                    ticker_symbol = f"{to_currency}USD=X"
+                    ticker = yf.Ticker(ticker_symbol)
+                    data = ticker.history(period="1d")
+                    if data.empty:
+                        raise ValueError("Données indisponibles pour la paire de devises.")
+                    rate = data["Close"].iloc[-1]
+                    factor = 1 / rate
+                elif to_currency == "USD":
+                    ticker_symbol = f"{from_currency}USD=X"
+                    ticker = yf.Ticker(ticker_symbol)
+                    data = ticker.history(period="1d")
+                    if data.empty:
+                        raise ValueError("Données indisponibles pour la paire de devises.")
+                    rate = data["Close"].iloc[-1]
+                    factor = rate
+                else:
+                    ticker_symbol_from = f"{from_currency}USD=X"
+                    ticker_from = yf.Ticker(ticker_symbol_from)
+                    data_from = ticker_from.history(period="1d")
+                    if data_from.empty:
+                        raise ValueError("Données indisponibles pour la paire de devises (source).")
+                    rate_from = data_from["Close"].iloc[-1]
+
+                    ticker_symbol_to = f"{to_currency}USD=X"
+                    ticker_to = yf.Ticker(ticker_symbol_to)
+                    data_to = ticker_to.history(period="1d")
+                    if data_to.empty:
+                        raise ValueError("Données indisponibles pour la paire de devises (cible).")
+                    rate_to = data_to["Close"].iloc[-1]
+                    factor = rate_from / rate_to
+
+                converted = amount * factor
+                self.label_conversion_result.config(text=f"{converted:.4f} {to_currency}")
+            except Exception as e:
+                messagebox.showerror("Erreur", f"Erreur lors de la conversion: {e}")
+
+    # ---------------------- Actualisation Live ----------------------
+
+    def refresh_live_data(self):
+        self.update_dashboard()
+        if self.portfolio:
+            _, _, total_value = self.portfolio.display_portfolio()
+            self.portfolio_history.append((datetime.now(), total_value))
+            self.update_analysis_chart()
+            self.check_alerts()
+        self.root.after(self.update_interval, self.refresh_live_data)
+
+
+# ---------------------- Lancement de l'application ----------------------
+if __name__ == "__main__":
+    root = ttk.Window(themename="darkly")
+    app = PortfolioApp(root)
+    root.mainloop()
